@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AR Half-Sphere Video World</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { 
+      margin: 0; 
+      overflow: hidden;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #overlay {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 1;
+    }
+    #start-button {
+      padding: 12px 24px;
+      font-size: 18px;
+      background: rgba(72, 118, 255, 0.8);
+      color: white;
+      border: none;
+      border-radius: 30px;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    #start-button:hover {
+      background: rgba(72, 118, 255, 1);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+    }
+    #status {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      padding: 12px 20px;
+      border-radius: 24px;
+      font-size: 16px;
+      font-weight: 500;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      max-width: 80%;
+      text-align: center;
+      display: none;
+      z-index: 1000;
+    }
+    .exit-ar {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: rgba(255, 255, 255, 0.25);
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 50px;
+      height: 50px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      cursor: pointer;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      z-index: 1000;
+      display: none;
+    }
+    .xr-active .exit-ar {
+      display: flex;
+    }
+    #debug {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: rgba(0, 0, 0, 0.7);
+      color: lime;
+      font-family: monospace;
+      padding: 5px;
+      font-size: 12px;
+      z-index: 100;
+      pointer-events: none;
+      max-width: 300px;
+      max-height: 200px;
+      overflow-y: auto;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start-button">Enter AR</button>
+  </div>
+  
+  <button class="exit-ar" id="exit-ar">×</button>
+  <div id="status"></div>
+  <div id="debug"></div>
+  
+  <!-- Hidden video element for preloading -->
+  <video id="video-source" style="display:none;" muted playsinline loop crossorigin="anonymous">
+    <source src="smartbackground.mp4" type="video/mp4">
+  </video>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+    
+    // ===========================================
+    // Constants and configuration
+    // ===========================================
+    const DEBUG = false;
+    const SPHERE_RADIUS = 0.5;
+    const SPHERE_SEGMENTS = 32;
+    const SPHERE_RINGS = 32;
+    const HOLD_DURATION = 500; // milliseconds to consider a hold
+    
+    // ===========================================
+    // Global variables
+    // ===========================================
+    let camera, scene, renderer;
+    let xrSession = null;
+    let xrReferenceSpace = null;
+    let halfSphere;
+    let videoElement;
+    let videoTexture;
+    let videoState = 'unloaded';
+    let controllers = [];
+    let activeControllers = new Set();
+    let initialControllerPositions = {};
+    let initialDistance = 0;
+    let initialRotation = 0;
+    let initialScale = new THREE.Vector3();
+    let selectedObject = null;
+    let markedObject = null;
+    let interactionMode = 'none';
+    let selectHoldTimer = null;
+    let characters = [];
+    let plane;
+    let initialPositions = {};
+    let grabOffset = new THREE.Vector3();
+    let initialObjectPosition = new THREE.Vector3();
+    
+    // ===========================================
+    // Debug logging
+    // ===========================================
+    const debugElement = document.getElementById('debug');
+    if (DEBUG) debugElement.style.display = 'block';
+    
+    function log(message) {
+      console.log(message);
+      if (DEBUG) {
+        debugElement.innerHTML += `${message}<br>`;
+        const lines = debugElement.innerHTML.split('<br>');
+        if (lines.length > 10) {
+          debugElement.innerHTML = lines.slice(-10).join('<br>');
+        }
+        debugElement.scrollTop = debugElement.scrollHeight;
+      }
+    }
+    
+    // ===========================================
+    // Show status message
+    // ===========================================
+    function showStatus(message, autoHide = true) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.style.display = 'block';
+      
+      log(message);
+      
+      if (autoHide) {
+        setTimeout(() => {
+          statusElement.style.display = 'none';
+        }, 3000);
+      }
+    }
+    
+    // ===========================================
+    // Initialize Three.js scene
+    // ===========================================
+    function initScene() {
+      scene = new THREE.Scene();
+      
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+      
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.shadowMap.enabled = true;
+      document.body.appendChild(renderer.domElement);
+      
+      const ambientLight = new THREE.AmbientLight(0x404040, 2);
+      scene.add(ambientLight);
+      
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+      directionalLight.position.set(1, 1, 1);
+      directionalLight.castShadow = true;
+      scene.add(directionalLight);
+      
+      window.addEventListener('resize', onWindowResize);
+      
+      log('Scene initialized');
+    }
+    
+    // ===========================================
+    // Initialize video element and texture
+    // ===========================================
+    function initVideo() {
+      log('Initializing video');
+      videoState = 'loading';
+      
+      videoElement = document.getElementById('video-source');
+      
+      videoElement.addEventListener('loadedmetadata', () => {
+        log('Video metadata loaded');
+      });
+      
+      videoElement.addEventListener('canplay', () => {
+        log('Video can play');
+        videoState = 'loaded';
+        createVideoTexture();
+      });
+      
+      videoElement.addEventListener('playing', () => {
+        log('Video playing');
+        videoState = 'playing';
+      });
+      
+      videoElement.addEventListener('error', (e) => {
+        const error = e.target.error;
+        log(`Video error: ${error ? error.message : 'unknown error'}`);
+        videoState = 'error';
+        showStatus('Error loading video', false);
+      });
+      
+      videoElement.load();
+      
+      setTimeout(() => {
+        if (videoState === 'loading') {
+          log('Video load timeout - continuing anyway');
+          videoState = 'loaded';
+          createVideoTexture();
+        }
+      }, 5000);
+    }
+    
+    // ===========================================
+    // Create video texture
+    // ===========================================
+    function createVideoTexture() {
+      try {
+        log('Creating video texture');
+        
+        videoTexture = new THREE.VideoTexture(videoElement);
+        videoTexture.minFilter = THREE.LinearFilter;
+        videoTexture.magFilter = THREE.LinearFilter;
+        videoTexture.format = THREE.RGBAFormat;
+        videoTexture.generateMipmaps = false;
+        
+        log('Video texture created');
+      } catch (error) {
+        log(`Error creating video texture: ${error}`);
+      }
+    }
+    
+    // ===========================================
+    // Start video playback with retry mechanism
+    // ===========================================
+    function startVideoPlayback() {
+      if (!videoElement || videoState === 'playing') return;
+      
+      log('Starting video playback');
+      
+      videoElement.play().then(() => {
+        log('Video playback started successfully');
+        videoState = 'playing';
+      }).catch(error => {
+        log(`Failed to autoplay video: ${error}`);
+        showStatus('Tap screen to start video');
+        
+        const startVideo = function() {
+          videoElement.play().then(() => {
+            log('Video started after user interaction');
+            videoState = 'playing';
+            document.removeEventListener('click', startVideo);
+          }).catch(err => {
+            log(`Video play failed after user interaction: ${err}`);
+          });
+        };
+        
+        document.addEventListener('click', startVideo);
+      });
+    }
+    
+    // ===========================================
+    // Create half-sphere with video projection
+    // ===========================================
+    function createHalfSphere() {
+      log('Creating half-sphere');
+      
+      const geometry = new THREE.SphereGeometry(
+        SPHERE_RADIUS,
+        SPHERE_SEGMENTS,
+        SPHERE_RINGS,
+        0,
+        Math.PI * 2,
+        0,
+        Math.PI / 2
+      );
+      
+      geometry.scale(-1, 1, 1);
+      
+      const material = new THREE.MeshBasicMaterial({
+        map: videoTexture,
+        side: THREE.FrontSide
+      });
+      
+      halfSphere = new THREE.Mesh(geometry, material);
+      
+      halfSphere.position.set(0, 0, -0.7);
+      halfSphere.rotation.x = Math.PI;
+      
+      scene.add(halfSphere);
+      
+      log('Half-sphere created');
+    }
+    
+    // Create a plane with small character balls
+    function createPlane() {
+      // Create a floating platform/plane
+      const planeGeometry = new THREE.BoxGeometry(0.4, 0.02, 0.2);
+      const planeMaterial = new THREE.MeshStandardMaterial({
+        color: 0x66ccff,
+        metalness: 0.5,
+        roughness: 0.3,
+        transparent: true,
+        opacity: 0.9
+      });
+      
+      plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.position.set(0, -0.1, -0.5);
+      plane.castShadow = true;
+      plane.receiveShadow = true;
+      
+      plane.userData = {
+        isInteractable: true,
+        originalPosition: plane.position.clone(),
+        originalRotation: plane.rotation.clone(),
+      };
+      
+      initialPositions.plane = plane.position.clone();
+      
+      scene.add(plane);
+      
+      createCharacters();
+    }
+    
+    // Create small character balls
+    function createCharacters() {
+      const colors = [0xff4444, 0x44ff44, 0x4444ff, 0xffff44];
+      
+      for (let i = 0; i < 4; i++) {
+        const size = 0.03;
+        const geometry = new THREE.SphereGeometry(size, 16, 16);
+        const material = new THREE.MeshStandardMaterial({
+          color: colors[i],
+          metalness: 0.3,
+          roughness: 0.4,
+          emissive: colors[i],
+          emissiveIntensity: 0.2
+        });
+        
+        const character = new THREE.Mesh(geometry, material);
+        
+        const posX = (i % 2 === 0) ? -0.1 : 0.1;
+        const posZ = (i < 2) ? -0.05 : 0.05;
+        character.position.set(posX, 0.03, posZ);
+        
+        character.userData = {
+          isInteractable: true,
+          index: i,
+          originalPosition: character.position.clone(),
+          originalRotation: character.rotation.clone(),
+        };
+        
+        initialPositions['character' + i] = character.position.clone();
+        
+        character.castShadow = true;
+        
+        characters.push(character);
+        plane.add(character);
+      }
+    }
+    
+    // ===========================================
+    // Start AR session
+    // ===========================================
+    function startAR() {
+      if (!navigator.xr) {
+        showStatus('WebXR not supported in this browser', false);
+        return;
+      }
+      
+      log('Starting AR session');
+      
+      navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+        if (!supported) {
+          showStatus('AR not supported on this device', false);
+          return;
+        }
+        
+        navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test'],
+          optionalFeatures: ['dom-overlay', 'hand-tracking'],
+          domOverlay: { root: document.body }
+        }).then(onSessionStarted);
+      });
+    }
+    
+    // ===========================================
+    // Handle AR session start
+    // ===========================================
+    function onSessionStarted(session) {
+      log('AR session started');
+      xrSession = session;
+      
+      document.getElementById('start-button').style.display = 'none';
+      document.body.classList.add('xr-active');
+      
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      session.requestReferenceSpace('local').then((referenceSpace) => {
+        xrReferenceSpace = referenceSpace;
+        
+        // Set up controllers
+        setupControllers(session);
+        
+        // Create our objects
+        createHalfSphere();
+        createPlane();
+        
+        // Start video playback
+        startVideoPlayback();
+        
+        // Start render loop
+        renderer.setAnimationLoop(render);
+        
+        // Handle session end
+        session.addEventListener('end', onSessionEnded);
+        
+        showStatus('AR experience loaded. Tap objects to interact.');
+      });
+    }
+    
+    function setupControllers(session) {
+      for (let i = 0; i < 2; i++) {
+        const controller = renderer.xr.getController(i);
+        controller.userData.id = i;
+        scene.add(controller);
+        
+        addHandVisual(controller, i === 0 ? 0x6699ff : 0xff6666);
+        
+        controller.addEventListener('selectstart', onSelectStart);
+        controller.addEventListener('selectend', onSelectEnd);
+        
+        controllers.push(controller);
+      }
+    }
+    
+    function addHandVisual(controller, color) {
+      const handGeometry = new THREE.SphereGeometry(0.025, 16, 16);
+      const handMaterial = new THREE.MeshStandardMaterial({
+        color: color,
+        roughness: 0.3,
+        metalness: 0.5,
+        transparent: true,
+        opacity: 0.7
+      });
+      const handMesh = new THREE.Mesh(handGeometry, handMaterial);
+      controller.add(handMesh);
+    }
+    
+    // ===========================================
+    // Handle AR session end
+    // ===========================================
+    function onSessionEnded() {
+      log('AR session ended');
+      
+      if (videoElement) {
+        videoElement.pause();
+        videoState = 'loaded';
+      }
+      
+      document.getElementById('start-button').style.display = 'block';
+      document.body.classList.remove('xr-active');
+      
+      xrSession = null;
+      xrReferenceSpace = null;
+      selectedObject = null;
+      markedObject = null;
+      characters = [];
+      controllers = [];
+      activeControllers.clear();
+      
+      if (halfSphere) {
+        scene.remove(halfSphere);
+        halfSphere.geometry.dispose();
+        halfSphere.material.dispose();
+        halfSphere = null;
+      }
+      
+      clearScene();
+      
+      renderer.setAnimationLoop(null);
+      
+      showStatus('AR session ended');
+    }
+    
+    function clearScene() {
+      while(scene.children.length > 0) { 
+        const object = scene.children[0];
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) object.material.dispose();
+        scene.remove(object); 
+      }
+    }
+    
+    function onSelectStart(event) {
+      const controller = event.target;
+      const controllerPos = new THREE.Vector3();
+      controller.getWorldPosition(controllerPos);
+      
+      activeControllers.add(controller.userData.id);
+      
+      selectHoldTimer = setTimeout(() => {
+        if (markedObject) {
+          selectedObject = markedObject;
+          interactionMode = 'move';
+          
+          if (selectedObject === plane) {
+            initialObjectPosition.copy(selectedObject.position);
+          } else {
+            selectedObject.getWorldPosition(initialObjectPosition);
+          }
+          
+          grabOffset.copy(initialObjectPosition).sub(controllerPos);
+          
+          initialControllerPositions[controller.userData.id] = controllerPos.clone();
+          
+          showStatus('Moving object. Use both hands to resize/rotate.');
+        } else {
+          const intersectedObject = findIntersectedObject(controllerPos);
+          
+          if (intersectedObject) {
+            selectedObject = intersectedObject;
+            interactionMode = 'move';
+            highlightObject(selectedObject, true);
+            
+            if (selectedObject === plane) {
+              initialObjectPosition.copy(selectedObject.position);
+            } else {
+              selectedObject.getWorldPosition(initialObjectPosition);
+            }
+            
+            grabOffset.copy(initialObjectPosition).sub(controllerPos);
+            
+            initialControllerPositions[controller.userData.id] = controllerPos.clone();
+            
+            showStatus('Moving object. Use both hands to resize/rotate.');
+          }
+        }
+      }, HOLD_DURATION);
+    }
+    
+    function onSelectEnd(event) {
+      const controller = event.target;
+      
+      activeControllers.delete(controller.userData.id);
+      
+      if (selectHoldTimer) {
+        clearTimeout(selectHoldTimer);
+        selectHoldTimer = null;
+        
+        if (interactionMode === 'none') {
+          const controllerPos = new THREE.Vector3();
+          controller.getWorldPosition(controllerPos);
+          
+          const intersectedObject = findIntersectedObject(controllerPos);
+          
+          if (intersectedObject) {
+            if (markedObject) {
+              highlightObject(markedObject, false);
+            }
+            
+            if (markedObject === intersectedObject) {
+              markedObject = null;
+              showStatus('Object unmarked.');
+            } else {
+              markedObject = intersectedObject;
+              highlightObject(markedObject, true);
+              showStatus('Object marked. Hold select to grab it.');
+            }
+          }
+        }
+      }
+      
+      if (interactionMode === 'transform') {
+        if (activeControllers.size === 1) {
+          interactionMode = 'move';
+          
+          const remainingControllerId = Array.from(activeControllers)[0];
+          const remainingController = controllers[remainingControllerId];
+          const controllerPos = new THREE.Vector3();
+          remainingController.getWorldPosition(controllerPos);
+          
+          if (selectedObject === plane) {
+            initialObjectPosition.copy(selectedObject.position);
+          } else {
+            selectedObject.getWorldPosition(initialObjectPosition);
+          }
+          
+          grabOffset.copy(initialObjectPosition).sub(controllerPos);
+          
+          showStatus('Transform complete. Still moving object.');
+        }
+        else if (activeControllers.size === 0) {
+          resetInteraction();
+        }
+      }
+      else if (interactionMode === 'move' && activeControllers.size === 0) {
+        resetInteraction();
+      }
+    }
+    
+    function resetInteraction() {
+      if (selectedObject && selectedObject !== markedObject) {
+        highlightObject(selectedObject, false);
+      }
+      
+      if (markedObject) {
+        highlightObject(markedObject, true);
+      }
+      
+      selectedObject = null;
+      interactionMode = 'none';
+      activeControllers.clear();
+      initialControllerPositions = {};
+      showStatus(markedObject ? 'Object still marked. Hold select to grab it.' : 'Tap objects to mark them.');
+    }
+    
+    function highlightObject(object, isHighlighted) {
+      if (!object || !object.material) return;
+      
+      if (isHighlighted) {
+        if (Array.isArray(object.material)) {
+          object.material.forEach(mat => {
+            mat.emissive = new THREE.Color(0x0088ff);
+            mat.emissiveIntensity = 0.5;
+          });
+        } else {
+          object.material.emissive = new THREE.Color(0x0088ff);
+          object.material.emissiveIntensity = 0.5;
+        }
+      } else {
+        if (Array.isArray(object.material)) {
+          object.material.forEach(mat => {
+            mat.emissive = new THREE.Color(0x000000);
+            mat.emissiveIntensity = 0;
+          });
+        } else {
+          object.material.emissive = new THREE.Color(0x000000);
+          object.material.emissiveIntensity = 0;
+        }
+      }
+    }
+    
+    function getControllerDistance() {
+      if (controllers.length < 2) return 0;
+      
+      const leftPos = new THREE.Vector3();
+      const rightPos = new THREE.Vector3();
+      
+      controllers[0].getWorldPosition(leftPos);
+      controllers[1].getWorldPosition(rightPos);
+      
+      return leftPos.distanceTo(rightPos);
+    }
+    
+    function findIntersectedObject(controllerPos) {
+      let closestObject = null;
+      let closestDistance = 0.2;
+      
+      const planeDistance = controllerPos.distanceTo(plane.position);
+      if (planeDistance < closestDistance) {
+        closestDistance = planeDistance;
+        closestObject = plane;
+      }
+      
+      const localControllerPos = plane.worldToLocal(controllerPos.clone());
+      
+      characters.forEach((character, index) => {
+        const worldCharPos = new THREE.Vector3();
+        character.getWorldPosition(worldCharPos);
+        const distance = controllerPos.distanceTo(worldCharPos);
+        
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          closestObject = character;
+        }
+      });
+      
+      return closestObject;
+    }
+    
+    function handleObjectInteraction() {
+      if (!selectedObject) return;
+      
+      if (interactionMode === 'move' && activeControllers.size === 1) {
+        const controllerId = Array.from(activeControllers)[0];
+        const controller = controllers[controllerId];
+        
+        const controllerPos = new THREE.Vector3();
+        controller.getWorldPosition(controllerPos);
+        
+        const newPosition = new THREE.Vector3().copy(controllerPos).add(grabOffset);
+        
+        if (selectedObject === plane) {
+          selectedObject.position.copy(newPosition);
+        } 
+        else if (characters.includes(selectedObject)) {
+          const localPos = plane.worldToLocal(newPosition.clone());
+          localPos.y = selectedObject.userData.originalPosition.y;
+          selectedObject.position.copy(localPos);
+        }
+      }
+      
+      else if (interactionMode === 'transform' && activeControllers.size === 2) {
+        const currentPositions = [];
+        controllers.forEach(controller => {
+          const pos = new THREE.Vector3();
+          controller.getWorldPosition(pos);
+          currentPositions[controller.userData.id] = pos;
+        });
+        
+        const currentDistance = getControllerDistance();
+        
+        if (initialDistance > 0) {
+          let scaleFactor = currentDistance / initialDistance;
+          scaleFactor = Math.max(0.5, Math.min(scaleFactor, 3.0));
+          selectedObject.scale.copy(initialScale).multiplyScalar(scaleFactor);
+        }
+        
+        const leftPos = currentPositions[0];
+        const rightPos = currentPositions[1];
+        
+        if (leftPos && rightPos) {
+          const vector = new THREE.Vector3().subVectors(rightPos, leftPos);
+          const currentAngle = Math.atan2(vector.x, vector.z);
+          
+          const rotationDelta = currentAngle - initialRotation;
+          selectedObject.rotation.y = selectedObject.userData.originalRotation.y + rotationDelta;
+          
+          const midpoint = new THREE.Vector3().addVectors(leftPos, rightPos).multiplyScalar(0.5);
+          const forward = new THREE.Vector3(0, 0, -0.05);
+          forward.applyQuaternion(camera.quaternion);
+          midpoint.add(forward);
+          
+          if (selectedObject === plane) {
+            selectedObject.position.copy(midpoint);
+          } 
+          else if (characters.includes(selectedObject)) {
+            const targetLocalPos = plane.worldToLocal(midpoint);
+            targetLocalPos.y = selectedObject.userData.originalPosition.y;
+            selectedObject.position.copy(targetLocalPos);
+          }
+        }
+      }
+    }
+    
+    // ===========================================
+    // Render function
+    // ===========================================
+    function render(time, frame) {
+      // Verify video is still playing
+      if (videoElement && videoState === 'playing' && videoElement.paused) {
+        videoElement.play().catch(err => {
+          log(`Video restart failed: ${err}`);
+        });
+      }
+      
+      // Animate characters not being interacted with
+      characters.forEach(character => {
+        if (character !== selectedObject && character !== markedObject) {
+          character.rotation.y += 0.01;
+        }
+      });
+      
+      // Slowly rotate the half-sphere
+      if (halfSphere) {
+        halfSphere.rotation.y += 0.001;
+      }
+      
+      if (frame) {
+        // Check two-controller interaction to switch to transform mode
+        if (selectedObject && interactionMode === 'move' && activeControllers.size === 2) {
+          interactionMode = 'transform';
+          
+          initialDistance = getControllerDistance();
+          initialScale.copy(selectedObject.scale);
+          
+          const leftPos = new THREE.Vector3();
+          const rightPos = new THREE.Vector3();
+          controllers[0].getWorldPosition(leftPos);
+          controllers[1].getWorldPosition(rightPos);
+          const vector = new THREE.Vector3().subVectors(rightPos, leftPos);
+          initialRotation = Math.atan2(vector.x, vector.z);
+          
+          showStatus('Transforming object (scale/rotate)');
+        }
+        
+        // Handle object interactions
+        if (selectedObject) {
+          handleObjectInteraction();
+        }
+      }
+      
+      renderer.render(scene, camera);
+    }
+    
+    // ===========================================
+    // Handle window resize
+    // ===========================================
+    function onWindowResize() {
+      if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      if (renderer) {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+    }
+    
+    // ===========================================
+    // Initialize everything
+    // ===========================================
+    function init() {
+      log('Initializing application');
+      
+      initScene();
+      initVideo();
+      
+      document.getElementById('start-button').addEventListener('click', startAR);
+      document.getElementById('exit-ar').addEventListener('click', onSessionEnded);
+      
+      log('Initialization complete');
+    }
+    
+    // Start the application
+    window.addEventListener('load', init);
+  </script>
+</body>
+</html>
